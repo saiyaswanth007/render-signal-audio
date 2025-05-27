@@ -9,5 +9,6 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
-      - key: PORT
-        value: "8000"
+      - key: HF_SPACE_URL
+        value: "androidguy-speaker-diarization.hf.space"
+      # PORT is injected automatically by Render

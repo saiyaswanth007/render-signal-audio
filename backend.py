@@ -103,16 +103,36 @@ async def health():
 @app.websocket("/ws_relay")
 async def websocket_relay(websocket: WebSocket):
     await websocket.accept()
+    logger.info("WebSocket relay connection established")
+    
+    # Create a local queue for this connection
+    local_queue = asyncio.Queue()
+    
+    # Add this client's queue to a list of clients to notify
     try:
-        # Use the existing RelayHandler's client_queue
-        tool_handler = RelayHandler()
+        # Forward messages from HF Space to this client
         while True:
-            # Get messages from HF and relay to this client
-            message = await tool_handler.client_queue.get()
-            await websocket.send_text(message)
+            try:
+                # Get the next message from the global handler's queue
+                message = await tool_handler.client_queue.get()
+                
+                # Send it to the client
+                await websocket.send_text(message)
+                
+                # Mark task as done
+                tool_handler.client_queue.task_done()
+                
+                # Put message back for other clients
+                await tool_handler.client_queue.put(message)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error forwarding message: {e}")
+                break
     except Exception as e:
         logger.error(f"WebSocket relay error: {e}")
     finally:
+        logger.info("WebSocket relay connection closed")
         await websocket.close()
 
 if __name__ == "__main__":

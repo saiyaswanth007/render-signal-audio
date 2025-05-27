@@ -100,6 +100,21 @@ async def root():
 async def health(): 
     return {"status": "ok", "connected_to_hf": tool_handler.ws_connection is not None}
 
+@app.websocket("/ws_relay")
+async def websocket_relay(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        # Use the existing RelayHandler's client_queue
+        tool_handler = RelayHandler()
+        while True:
+            # Get messages from HF and relay to this client
+            message = await tool_handler.client_queue.get()
+            await websocket.send_text(message)
+    except Exception as e:
+        logger.error(f"WebSocket relay error: {e}")
+    finally:
+        await websocket.close()
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))

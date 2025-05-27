@@ -9,7 +9,10 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.10.0"                     # ⇐ lock to Python 3.10.0
       - key: HF_SPACE_URL
         value: "androidguy-speaker-diarization.hf.space"
       - key: LOG_LEVEL
         value: "INFO"
+      # PORT is injected automatically by Render

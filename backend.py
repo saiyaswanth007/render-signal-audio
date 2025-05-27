@@ -1,4 +1,5 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI
+import websockets as WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import asyncio

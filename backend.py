@@ -1,10 +1,10 @@
-from fastapi import FastAPI
-import websockets as WebSocket
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import asyncio
 import logging
 from fastrtc import Stream, AsyncStreamHandler
+import websockets  # Added import for websockets package
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +40,7 @@ class RelayHandler(AsyncStreamHandler):
         """Connect to HF Space WebSocket when starting"""
         logger.info(f"Connecting to WebSocket at {API_WS}")
         try:
-            self.ws_connection = await WebSocket.connect(API_WS)
+            self.ws_connection = await websockets.connect(API_WS)
             logger.info("WebSocket connection established")
             asyncio.create_task(self.receive_from_hf())
         except Exception as e:
@@ -58,7 +58,7 @@ class RelayHandler(AsyncStreamHandler):
         try:
             data = frame.data if hasattr(frame, 'data') else frame
             if self.ws_connection:
-                await self.ws_connection.send_bytes(data)
+                await self.ws_connection.send(data)
             else:
                 logger.warning("No WebSocket connection to HF Space")
                 await self.start_up()
@@ -72,7 +72,7 @@ class RelayHandler(AsyncStreamHandler):
                 if not self.ws_connection:
                     await asyncio.sleep(1)
                     continue
-                message = await self.ws_connection.receive_text()
+                message = await self.ws_connection.recv()
                 await self.client_queue.put(message)
             except Exception as e:
                 logger.error(f"Error receiving from HF Space: {e}")

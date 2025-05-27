@@ -92,11 +92,11 @@ tool_handler = RelayHandler()
 stream = Stream(handler=tool_handler, modality="audio", mode="send-receive")
 stream.mount(app)
 
-@app.get("/")
+@app.get("/", methods=["GET", "HEAD"])
 async def root():
     return {"message": "Speaker Diarization Signaling Server"}
 
-@app.get("/health")
+@app.get("/health", methods=["GET", "HEAD"])
 async def health(): 
     return {"status": "ok", "connected_to_hf": tool_handler.ws_connection is not None}
 

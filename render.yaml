@@ -11,4 +11,5 @@ services:
     envVars:
       - key: HF_SPACE_URL
         value: "androidguy-speaker-diarization.hf.space"
-      # PORT is injected automatically by Render
+      - key: LOG_LEVEL
+        value: "INFO"

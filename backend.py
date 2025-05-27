@@ -103,17 +103,16 @@ class RelayHandler(AsyncStreamHandler):
         return None
 
 # Set up FastRTC stream for audio
+# Set up FastRTC stream for audio
 handler = RelayHandler()
-stream = Stream(
-    handler=handler, 
-    modality="audio", 
-    mode="send-receive"
-)
-app.include_router(stream.router, prefix="/stream")
+stream  = Stream(handler=handler, modality="audio", mode="send-receive")
+router  = stream.get_router()           # <-- use get_router()
+app.include_router(router, prefix="/stream")
 
 @app.get("/")
 async def root():
     return {"message": "Speaker Diarization Signaling Server"}
+
 
 @app.get("/health")
 async def health(): 

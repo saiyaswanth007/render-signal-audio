@@ -6,8 +6,9 @@ import logging
 import json
 from fastrtc import Stream, AsyncStreamHandler
 import websockets 
-from typing import Set
+from typing import Set, Dict, Any
 import base64
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,16 +29,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class ConnectionManager:
+    """Manages WebSocket connections and broadcasting"""
+    
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
+        self.connection_metadata: Dict[WebSocket, Dict] = {}
+    
+    async def connect(self, websocket: WebSocket, client_id: str = None):
+        """Add a new WebSocket connection"""
+        await websocket.accept()
+        self.active_connections.add(websocket)
+        self.connection_metadata[websocket] = {
+            "client_id": client_id or f"client_{int(time.time())}",
+            "connected_at": time.time(),
+            "messages_sent": 0
+        }
+        
+        logger.info(f"WebSocket connected: {self.connection_metadata[websocket]['client_id']}. "
+                   f"Total connections: {len(self.active_connections)}")
+    
+    def disconnect(self, websocket: WebSocket):
+        """Remove a WebSocket connection"""
+        if websocket in self.active_connections:
+            client_info = self.connection_metadata.get(websocket, {})
+            client_id = client_info.get("client_id", "unknown")
+            
+            self.active_connections.discard(websocket)
+            self.connection_metadata.pop(websocket, None)
+            
+            logger.info(f"WebSocket disconnected: {client_id}. "
+                       f"Remaining connections: {len(self.active_connections)}")
+    
+    async def broadcast(self, message: str):
+        """Broadcast message to all active connections"""
+        if not self.active_connections:
+            return
+        
+        disconnected = set()
+        
+        for websocket in self.active_connections.copy():
+            try:
+                await websocket.send_text(message)
+                if websocket in self.connection_metadata:
+                    self.connection_metadata[websocket]["messages_sent"] += 1
+            except Exception as e:
+                logger.warning(f"Failed to send message to client: {e}")
+                disconnected.add(websocket)
+        
+        # Clean up disconnected clients
+        for ws in disconnected:
+            self.disconnect(ws)
+    
+    def get_stats(self):
+        """Get connection statistics"""
+        return {
+            "active_connections": len(self.active_connections),
+            "connection_metadata": {
+                k: v for k, v in enumerate(
+                    [{"client_id": m.get("client_id", "unknown"), 
+                      "connected_at": m.get("connected_at", 0),
+                      "messages_sent": m.get("messages_sent", 0)} 
+                     for m in self.connection_metadata.values()]
+                )
+            }
+        }
+
 class AudioTranscriptionRelay(AsyncStreamHandler):
     """Handler to relay real-time audio for transcription and speaker diarization"""
     
     def __init__(self):
         super().__init__()
         self.hf_ws_connection = None
-        self.transcript_clients: Set[WebSocket] = set()
+        self.connection_manager = ConnectionManager()
         self.connection_lock = asyncio.Lock()
         self.is_connected = False
         self.reconnect_task = None
+        self.connection_stats = {
+            "total_connections": 0,
+            "last_audio_received": None,
+            "total_audio_chunks": 0,
+            "system_start_time": time.time()
+        }
         
     def copy(self): 
         # Return the same instance to maintain shared state across audio frames
@@ -114,6 +187,10 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
             else:
                 audio_data = frame
             
+            # Update statistics
+            self.connection_stats["last_audio_received"] = time.time()
+            self.connection_stats["total_audio_chunks"] += 1
+            
             # Ensure connection to HF Space
             if not self.is_connected:
                 await self.start_up()
@@ -174,45 +251,33 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
     
     async def broadcast_transcript(self, transcript_data):
         """Broadcast transcription results to all connected clients"""
-        if not self.transcript_clients:
+        if not self.connection_manager.active_connections:
             return
             
         # Prepare message for clients
         message = json.dumps({
             "type": "transcription",
-            "timestamp": asyncio.get_event_loop().time(),
+            "timestamp": time.time(),
             "data": transcript_data
         })
         
-        # Remove disconnected clients while broadcasting
-        disconnected_clients = set()
-        
-        for client in self.transcript_clients.copy():
-            try:
-                await client.send_text(message)
-            except Exception as e:
-                logger.warning(f"Failed to send transcription to client: {e}")
-                disconnected_clients.add(client)
-        
-        # Clean up disconnected clients
-        self.transcript_clients -= disconnected_clients
-        
-        if disconnected_clients:
-            logger.info(f"Removed {len(disconnected_clients)} disconnected clients")
-    
-    def add_transcript_client(self, websocket: WebSocket):
-        """Add a client for receiving transcription results"""
-        self.transcript_clients.add(websocket)
-        logger.info(f"Transcript client added. Total clients: {len(self.transcript_clients)}")
-    
-    def remove_transcript_client(self, websocket: WebSocket):
-        """Remove a transcription client"""
-        self.transcript_clients.discard(websocket)
-        logger.info(f"Transcript client removed. Total clients: {len(self.transcript_clients)}")
+        # Use connection manager to broadcast
+        await self.connection_manager.broadcast(message)
     
     async def emit(self):
         """Called by FastRTC - no need to emit anything here as we handle in broadcast"""
         return None
+    
+    def get_stats(self):
+        """Get comprehensive connection statistics"""
+        ws_stats = self.connection_manager.get_stats()
+        
+        return {
+            "hf_space_connected": self.is_connected,
+            "connection_stats": self.connection_stats,
+            "websocket_stats": ws_stats,
+            "system_uptime": time.time() - self.connection_stats["system_start_time"]
+        }
 
 # Initialize the audio transcription relay
 audio_relay = AudioTranscriptionRelay()
@@ -247,27 +312,32 @@ async def health():
     return {
         "status": "ok", 
         "hf_space_connected": audio_relay.is_connected,
-        "transcript_clients": len(audio_relay.transcript_clients),
+        "transcript_clients": len(audio_relay.connection_manager.active_connections),
         "hf_space_url": HF_SPACE_URL
     }
+
+@app.get("/stats")
+async def get_stats():
+    """Get comprehensive connection statistics"""
+    return audio_relay.get_stats()
 
 @app.websocket("/ws_transcription")
 async def websocket_transcription(websocket: WebSocket):
     """WebSocket endpoint for receiving real-time transcription results"""
-    await websocket.accept()
-    logger.info("Transcription WebSocket client connected")
-    
-    # Add this client to receive transcription broadcasts
-    audio_relay.add_transcript_client(websocket)
-    
-    # Send connection confirmation
-    await websocket.send_text(json.dumps({
-        "type": "connection",
-        "status": "connected",
-        "hf_space_status": "connected" if audio_relay.is_connected else "disconnected"
-    }))
+    client_id = f"client_{int(time.time())}"
     
     try:
+        # Add this client to receive transcription broadcasts
+        await audio_relay.connection_manager.connect(websocket, client_id)
+        
+        # Send connection confirmation
+        await websocket.send_text(json.dumps({
+            "type": "connection",
+            "status": "connected",
+            "timestamp": time.time(),
+            "hf_space_status": "connected" if audio_relay.is_connected else "disconnected"
+        }))
+        
         # Keep connection alive and handle any client messages
         while True:
             try:
@@ -294,11 +364,7 @@ async def websocket_transcription(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Transcription WebSocket error: {e}")
     finally:
-        audio_relay.remove_transcript_client(websocket)
-        try:
-            await websocket.close()
-        except:
-            pass
+        audio_relay.connection_manager.disconnect(websocket)
 
 # Legacy endpoint for backward compatibility
 @app.websocket("/ws_relay")

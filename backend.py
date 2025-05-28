@@ -1,10 +1,12 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import asyncio
 import logging
+import json
 from fastrtc import Stream, AsyncStreamHandler
 import websockets 
+from typing import Set
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,67 +33,143 @@ class RelayHandler(AsyncStreamHandler):
     def __init__(self):
         super().__init__()
         self.ws_connection = None
-        self.client_queue = asyncio.Queue()
+        self.clients: Set[WebSocket] = set()
+        self.connection_lock = asyncio.Lock()
+        self.reconnect_task = None
         
     def copy(self): 
-        return RelayHandler()
+        # Return the same instance for shared state
+        return self
     
     async def start_up(self):
         """Connect to HF Space WebSocket when starting"""
-        logger.info(f"Connecting to WebSocket at {API_WS}")
-        try:
-            self.ws_connection = await websockets.connect(API_WS)
-            logger.info("WebSocket connection established")
-            asyncio.create_task(self.receive_from_hf())
-        except Exception as e:
-            logger.error(f"Failed to connect to HF Space WebSocket: {e}")
-            self.ws_connection = None
+        async with self.connection_lock:
+            if self.ws_connection:
+                return
+                
+            logger.info(f"Connecting to WebSocket at {API_WS}")
+            try:
+                self.ws_connection = await websockets.connect(API_WS)
+                logger.info("WebSocket connection established")
+                
+                # Start background task to receive messages
+                if self.reconnect_task:
+                    self.reconnect_task.cancel()
+                self.reconnect_task = asyncio.create_task(self.receive_from_hf())
+                
+            except Exception as e:
+                logger.error(f"Failed to connect to HF Space WebSocket: {e}")
+                self.ws_connection = None
+                # Schedule reconnection
+                self.reconnect_task = asyncio.create_task(self.auto_reconnect())
     
     async def shutdown(self):
         """Close WebSocket connection when shutting down"""
-        if self.ws_connection:
-            await self.ws_connection.close()
-            logger.info("WebSocket connection closed")
+        async with self.connection_lock:
+            if self.reconnect_task:
+                self.reconnect_task.cancel()
+                
+            if self.ws_connection:
+                await self.ws_connection.close()
+                self.ws_connection = None
+                logger.info("WebSocket connection closed")
+    
+    async def auto_reconnect(self):
+        """Automatically reconnect to HF Space WebSocket"""
+        while True:
+            try:
+                await asyncio.sleep(5)  # Wait before reconnecting
+                if not self.ws_connection:
+                    await self.start_up()
+                    break
+            except Exception as e:
+                logger.error(f"Reconnection failed: {e}")
     
     async def receive(self, frame):
         """Receive audio data from client and forward to HF Space"""
         try:
             data = frame.data if hasattr(frame, 'data') else frame
+            
+            if not self.ws_connection:
+                await self.start_up()
+                
             if self.ws_connection:
                 await self.ws_connection.send(data)
             else:
                 logger.warning("No WebSocket connection to HF Space")
-                await self.start_up()
+                
         except Exception as e:
             logger.error(f"Error in receive: {e}")
+            # Trigger reconnection
+            self.ws_connection = None
+            asyncio.create_task(self.start_up())
     
     async def receive_from_hf(self):
-        """Background task to receive messages from HF Space and queue them"""
-        while True:
+        """Background task to receive messages from HF Space and broadcast to clients"""
+        while self.ws_connection:
             try:
-                if not self.ws_connection:
-                    await asyncio.sleep(1)
-                    continue
                 message = await self.ws_connection.recv()
-                await self.client_queue.put(message)
+                # Broadcast to all connected clients
+                await self.broadcast_to_clients(message)
+                
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("HF Space WebSocket connection closed")
+                self.ws_connection = None
+                break
             except Exception as e:
                 logger.error(f"Error receiving from HF Space: {e}")
-                await asyncio.sleep(2)
-                await self.start_up()
+                self.ws_connection = None
+                break
+        
+        # Try to reconnect
+        asyncio.create_task(self.auto_reconnect())
+    
+    async def broadcast_to_clients(self, message):
+        """Broadcast message to all connected WebSocket clients"""
+        if not self.clients:
+            return
+            
+        # Remove disconnected clients
+        disconnected = set()
+        
+        for client in self.clients.copy():
+            try:
+                await client.send_text(message)
+            except Exception as e:
+                logger.warning(f"Failed to send to client: {e}")
+                disconnected.add(client)
+        
+        # Remove disconnected clients
+        self.clients -= disconnected
+    
+    def add_client(self, websocket: WebSocket):
+        """Add a client WebSocket connection"""
+        self.clients.add(websocket)
+        logger.info(f"Client added. Total clients: {len(self.clients)}")
+    
+    def remove_client(self, websocket: WebSocket):
+        """Remove a client WebSocket connection"""
+        self.clients.discard(websocket)
+        logger.info(f"Client removed. Total clients: {len(self.clients)}")
     
     async def emit(self):
-        """Send queued messages from HF Space to client"""
-        try:
-            if not self.client_queue.empty():
-                return self.client_queue.get_nowait()
-        except Exception as e:
-            logger.error(f"Error in emit: {e}")
+        """This method is called by FastRTC - we don't need to return anything here"""
         return None
 
 # Set up FastRTC stream and mount it on the FastAPI app
 tool_handler = RelayHandler()
 stream = Stream(handler=tool_handler, modality="audio", mode="send-receive")
 stream.mount(app)
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize WebSocket connection on startup"""
+    await tool_handler.start_up()
+
+@app.on_event("shutdown") 
+async def shutdown_event():
+    """Clean up on shutdown"""
+    await tool_handler.shutdown()
 
 @app.get("/")
 @app.head("/")
@@ -101,42 +179,44 @@ async def root():
 @app.get("/health")
 @app.head("/health")
 async def health(): 
-    return {"status": "ok", "connected_to_hf": tool_handler.ws_connection is not None}
+    return {
+        "status": "ok", 
+        "connected_to_hf": tool_handler.ws_connection is not None,
+        "connected_clients": len(tool_handler.clients)
+    }
 
 @app.websocket("/ws_relay")
 async def websocket_relay(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket relay connection established")
     
-    # Create a local queue for this connection
-    local_queue = asyncio.Queue()
+    # Add this client to the handler
+    tool_handler.add_client(websocket)
     
-    # Add this client's queue to a list of clients to notify
     try:
-        # Forward messages from HF Space to this client
+        # Keep the connection alive and handle any incoming messages
         while True:
             try:
-                # Get the next message from the global handler's queue
-                message = await tool_handler.client_queue.get()
+                # Wait for messages from client (if any)
+                message = await websocket.receive_text()
+                logger.info(f"Received message from client: {message}")
+            
                 
-                # Send it to the client
-                await websocket.send_text(message)
-                
-                # Mark task as done
-                tool_handler.client_queue.task_done()
-                
-                # Put message back for other clients
-                await tool_handler.client_queue.put(message)
-            except asyncio.CancelledError:
+            except WebSocketDisconnect:
+                logger.info("Client disconnected")
                 break
             except Exception as e:
-                logger.error(f"Error forwarding message: {e}")
+                logger.error(f"Error in WebSocket relay: {e}")
                 break
+                
     except Exception as e:
         logger.error(f"WebSocket relay error: {e}")
     finally:
-        logger.info("WebSocket relay connection closed")
-        await websocket.close()
+        tool_handler.remove_client(websocket)
+        try:
+            await websocket.close()
+        except:
+            pass
 
 if __name__ == "__main__":
     import uvicorn

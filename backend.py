@@ -118,33 +118,14 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
         return self
     
     async def start_up(self):
-        """Connect to HF Space WebSocket for audio processing"""
-        async with self.connection_lock:
-            if self.hf_ws_connection and self.is_connected:
-                return
-                
-            logger.info(f"Connecting to HF Space WebSocket at {API_WS}")
-            try:
-                self.hf_ws_connection = await websockets.connect(
-                    API_WS,
-                    ping_interval=30,
-                    ping_timeout=10,
-                    max_size=None  # Allow large audio frames
-                )
-                self.is_connected = True
-                logger.info("HF Space WebSocket connection established")
-                
-                # Start background task to receive transcription results
-                if self.reconnect_task:
-                    self.reconnect_task.cancel()
-                self.reconnect_task = asyncio.create_task(self.receive_transcription_results())
-                
-            except Exception as e:
-                logger.error(f"Failed to connect to HF Space WebSocket: {e}")
-                self.hf_ws_connection = None
-                self.is_connected = False
-                # Schedule reconnection
-                asyncio.create_task(self.auto_reconnect())
+        logger.info(f"Connecting to WebSocket at {API_WS}")
+        try:
+            self.ws_connection = await websockets.connect(API_WS)
+            logger.info("WebSocket connection established")
+            asyncio.create_task(self.receive_from_hf())
+        except Exception as e:
+            logger.error(f"Failed to connect to HF Space WebSocket: {e}")
+            self.ws_connection = None
     
     async def shutdown(self):
         """Close WebSocket connection when shutting down"""

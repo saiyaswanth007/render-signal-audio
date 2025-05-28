@@ -127,6 +127,19 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
             logger.error(f"Failed to connect to HF Space WebSocket: {e}")
             self.ws_connection = None
     
+    async def receive_from_hf(self):
+        """Dummy receiver to avoid startup crash — replace with actual logic if needed"""
+        try:
+            while self.ws_connection:
+                message = await self.ws_connection.recv()
+                logger.info(f"Received message from HF: {message}")
+                # Process the message as needed — or just log
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Error in receive_from_hf: {e}")
+            self.ws_connection = None
+
+    
     async def shutdown(self):
         """Close WebSocket connection when shutting down"""
         async with self.connection_lock:

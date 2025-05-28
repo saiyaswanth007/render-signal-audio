@@ -221,20 +221,36 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
                 # Parse the result (assuming JSON format)
                 try:
                     if isinstance(result, str):
-                        transcript_data = json.loads(result)
+                        message_data = json.loads(result)
+                        
+                        # Log the message type
+                        message_type = message_data.get("type", "unknown")
+                        logger.info(f"Received message of type: {message_type} from HF Space")
+                        
+                        if message_type == "processing_result":
+                            # This is a processing result from process_audio_chunk
+                            logger.debug(f"Processing result: {message_data.get('data', {})}")
+                            
+                        elif message_type == "conversation_update":
+                            # This is a conversation update
+                            logger.info("Received conversation update")
+                            
+                        elif message_type == "error":
+                            # This is an error message
+                            logger.warning(f"Received error from HF Space: {message_data.get('message', 'Unknown error')}")
+                            
+                        # Forward all messages to clients regardless of type
+                        await self.broadcast_transcript(message_data)
+                        
                     else:
                         # Handle binary data if needed
-                        transcript_data = {"raw_data": base64.b64encode(result).decode()}
-                    
-                    logger.info(f"Received transcription: {transcript_data}")
-                    
-                    # Broadcast transcription results to all connected clients
-                    await self.broadcast_transcript(transcript_data)
+                        message_data = {"type": "binary_data", "data": {"raw_data": base64.b64encode(result).decode()}}
+                        await self.broadcast_transcript(message_data)
                     
                 except json.JSONDecodeError:
                     # Handle non-JSON responses
                     logger.warning(f"Received non-JSON response: {result}")
-                    await self.broadcast_transcript({"message": str(result)})
+                    await self.broadcast_transcript({"type": "raw_message", "data": {"message": str(result)}})
                 
             except websockets.exceptions.ConnectionClosed:
                 logger.info("HF Space WebSocket connection closed")
@@ -249,17 +265,22 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
         if not self.is_connected:
             asyncio.create_task(self.auto_reconnect())
     
-    async def broadcast_transcript(self, transcript_data):
-        """Broadcast transcription results to all connected clients"""
+    async def broadcast_transcript(self, data):
+        """Broadcast data to all connected clients"""
         if not self.connection_manager.active_connections:
             return
             
-        # Prepare message for clients
-        message = json.dumps({
-            "type": "transcription",
-            "timestamp": time.time(),
-            "data": transcript_data
-        })
+        # If data is already a dictionary with a type, use it directly
+        # Otherwise wrap it in a transcription message
+        if isinstance(data, dict) and "type" in data:
+            message = json.dumps(data)
+        else:
+            # Prepare message for clients
+            message = json.dumps({
+                "type": "transcription",
+                "timestamp": time.time(),
+                "data": data
+            })
         
         # Use connection manager to broadcast
         await self.connection_manager.broadcast(message)

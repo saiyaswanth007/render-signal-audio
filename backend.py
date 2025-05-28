@@ -9,6 +9,7 @@ import websockets
 from typing import Set, Dict, Any
 import base64
 import time
+import numpy as np
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -269,6 +270,20 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
         """Broadcast data to all connected clients"""
         if not self.connection_manager.active_connections:
             return
+            
+        # Convert NumPy types to Python native types
+        def convert_numpy_types(obj):
+            if isinstance(obj, np.number):
+                return obj.item()
+            elif isinstance(obj, dict):
+                return {k: convert_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_numpy_types(i) for i in obj]
+            else:
+                return obj
+        
+        # Apply conversion
+        data = convert_numpy_types(data)
             
         # If data is already a dictionary with a type, use it directly
         # Otherwise wrap it in a transcription message

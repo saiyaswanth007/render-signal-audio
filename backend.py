@@ -120,24 +120,31 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
     async def start_up(self):
         logger.info(f"Connecting to WebSocket at {API_WS}")
         try:
-            self.ws_connection = await websockets.connect(API_WS)
+            self.hf_ws_connection = await websockets.connect(API_WS)
             logger.info("WebSocket connection established")
+            self.is_connected = True
+            # Update connection statistics
+            self.connection_stats["total_connections"] += 1
+            # Start the receiver task
             asyncio.create_task(self.receive_from_hf())
+            # Start the transcription results receiver
+            asyncio.create_task(self.receive_transcription_results())
         except Exception as e:
             logger.error(f"Failed to connect to HF Space WebSocket: {e}")
-            self.ws_connection = None
+            self.hf_ws_connection = None
+            self.is_connected = False
     
     async def receive_from_hf(self):
         """Dummy receiver to avoid startup crash — replace with actual logic if needed"""
         try:
-            while self.ws_connection:
-                message = await self.ws_connection.recv()
+            while self.hf_ws_connection:
+                message = await self.hf_ws_connection.recv()
                 logger.info(f"Received message from HF: {message}")
                 # Process the message as needed — or just log
                 await asyncio.sleep(0.1)
         except Exception as e:
             logger.error(f"Error in receive_from_hf: {e}")
-            self.ws_connection = None
+            self.hf_ws_connection = None
 
     
     async def shutdown(self):
@@ -162,8 +169,9 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
             try:
                 await asyncio.sleep(min(2 ** retry_count, 30))  # Exponential backoff
                 await self.start_up()
-                if self.is_connected:
+                if self.hf_ws_connection:
                     logger.info("Successfully reconnected to HF Space")
+                    self.is_connected = True
                     break
                 retry_count += 1
             except Exception as e:
@@ -186,9 +194,12 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
             self.connection_stats["last_audio_received"] = time.time()
             self.connection_stats["total_audio_chunks"] += 1
             
-            # Ensure connection to HF Space
+            # Ensure connection to HF Space using the lock to prevent race conditions
             if not self.is_connected:
-                await self.start_up()
+                async with self.connection_lock:
+                    # Check again after acquiring lock as another task may have connected
+                    if not self.is_connected and not self.reconnect_task or self.reconnect_task.done():
+                        await self.start_up()
                 
             if self.hf_ws_connection and self.is_connected:
                 # Send raw audio data to HF Space for processing
@@ -200,11 +211,20 @@ class AudioTranscriptionRelay(AsyncStreamHandler):
         except websockets.exceptions.ConnectionClosed:
             logger.warning("HF Space connection closed during audio send")
             self.is_connected = False
-            asyncio.create_task(self.auto_reconnect())
+            
+            # Start reconnection if not already in progress
+            async with self.connection_lock:
+                if not self.reconnect_task or self.reconnect_task.done():
+                    self.reconnect_task = asyncio.create_task(self.auto_reconnect())
+            
         except Exception as e:
             logger.error(f"Error sending audio to HF Space: {e}")
             self.is_connected = False
-            asyncio.create_task(self.auto_reconnect())
+            
+            # Start reconnection if not already in progress
+            async with self.connection_lock:
+                if not self.reconnect_task or self.reconnect_task.done():
+                    self.reconnect_task = asyncio.create_task(self.auto_reconnect())
     
     async def receive_transcription_results(self):
         """Background task to receive transcription/diarization results from HF Space"""
